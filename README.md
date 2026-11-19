@@ -1,3 +1,7 @@
+[![make.fun · gta6-trophy-rarity-forecast-01](https://make.fun/badge/gta6-trophy-rarity-forecast-01.svg)](https://make.fun/bounty/gta6-trophy-rarity-forecast-01)
+[![rank](https://make.fun/badge/gta6-trophy-rarity-forecast-01/langsa5kilo-alt/gta6-rarity-forecast/rank.svg)](https://make.fun/bounty/gta6-trophy-rarity-forecast-01/leaderboard)
+[![reward](https://make.fun/badge/gta6-trophy-rarity-forecast-01/langsa5kilo-alt/gta6-rarity-forecast/reward.svg)](https://make.fun/bounty/gta6-trophy-rarity-forecast-01)
+
 # GTA VI Trophy Rarity Forecast
 
 This is a standard-library Python entry for make.fun's `gta6-trophy-rarity-forecast-01` competition. It forecasts five earn-rate quantiles for every GTA VI trophy.
