@@ -1,156 +1,172 @@
-"""Adaptive logit forecasts for GTA VI trophy earn rates."""
-
-import json
-import math
-import os
-from datetime import datetime
-from pathlib import Path
+import json as json_codec
+import math as numbers
+import os as environment
+from datetime import datetime as DateTime
+from pathlib import Path as FilePath
 
 
-INPUT_DIR = Path(os.environ.get("MAKEFUN_INPUT_DIR", "/input"))
-OUTPUT_DIR = Path(os.environ.get("MAKEFUN_OUTPUT_DIR", "/output"))
-LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95]
-Z_SCORES = [-1.645, -0.674, 0.0, 0.674, 1.645]
-HISTORY_WINDOW = 12
-BASE_SHRINKAGE = 0.30
-
-# Practice one-step backtest (cuts 3 and 4, averaged across p00 and p01):
-# starter persistence  0.030090 / 0.030090 / mean 0.030090
-# adaptive model       0.005032 / 0.005032 / mean 0.005032
+QUANTILE_LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95]
+NORMAL_OFFSETS = [-1.645, -0.674, 0.0, 0.674, 1.645]
+MAX_READS = 12
+POOLING_STRENGTH = 0.30
 
 
-def clamp_rate(rate):
-    return min(99.99, max(0.01, float(rate)))
+def bounded_rate(number):
+    return max(0.01, min(99.99, float(number)))
 
 
-def logit(rate):
-    rate = clamp_rate(rate)
-    return math.log(rate / (100.0 - rate))
+def rate_to_log_odds(rate):
+    percent = bounded_rate(rate)
+    return numbers.log(percent / (100.0 - percent))
 
 
-def inv_logit(value):
-    if value >= 0.0:
-        decay = math.exp(-value)
-        return 100.0 / (1.0 + decay)
-    growth = math.exp(value)
-    return 100.0 * growth / (1.0 + growth)
+def log_odds_to_rate(log_odds):
+    if log_odds < 0.0:
+        odds = numbers.exp(log_odds)
+        return 100.0 * odds / (1.0 + odds)
+    inverse_odds = numbers.exp(-log_odds)
+    return 100.0 / (1.0 + inverse_odds)
 
 
-def parse_time(value):
-    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+def timestamp(text):
+    return DateTime.fromisoformat(text.replace("Z", "+00:00"))
 
 
-def linear_fit(xs, ys):
-    """Fit a line and return intercept, slope, residual SD, and R squared."""
-    count = len(xs)
-    if count < 2:
-        return ys[-1], 0.0, 0.0, 0.0
-    x_mean = sum(xs) / count
-    y_mean = sum(ys) / count
-    x_ss = sum((x - x_mean) ** 2 for x in xs)
-    if x_ss < 1e-15:
-        return y_mean, 0.0, 0.0, 0.0
-    slope = sum((x - x_mean) * (y - y_mean) for x, y in zip(xs, ys)) / x_ss
-    intercept = y_mean - slope * x_mean
-    residual_ss = sum((y - intercept - slope * x) ** 2 for x, y in zip(xs, ys))
-    residual_sd = math.sqrt(residual_ss / (count - 2)) if count > 2 else 0.0
-    total_ss = sum((y - y_mean) ** 2 for y in ys)
-    r_squared = 1.0 - residual_ss / total_ss if total_ss > 0.0 else 0.0
-    return intercept, slope, residual_sd, min(1.0, max(0.0, r_squared))
+def least_squares(points):
+    count = len(points)
+    if count <= 1:
+        return {"constant": points[-1][1], "gradient": 0.0, "sd": 0.0, "quality": 0.0}
+    mean_x = sum(x for x, _ in points) / count
+    mean_y = sum(y for _, y in points) / count
+    spread_x = sum((x - mean_x) ** 2 for x, _ in points)
+    if spread_x < 1e-15:
+        return {"constant": mean_y, "gradient": 0.0, "sd": 0.0, "quality": 0.0}
+    gradient = sum((x - mean_x) * (y - mean_y) for x, y in points) / spread_x
+    constant = mean_y - gradient * mean_x
+    squared_error = sum((y - constant - gradient * x) ** 2 for x, y in points)
+    sd = numbers.sqrt(squared_error / (count - 2)) if count > 2 else 0.0
+    total_variation = sum((y - mean_y) ** 2 for _, y in points)
+    quality = 1.0 - squared_error / total_variation if total_variation > 0.0 else 0.0
+    return {
+        "constant": constant,
+        "gradient": gradient,
+        "sd": sd,
+        "quality": max(0.0, min(1.0, quality)),
+    }
 
 
-def evidence_weighted_slope(slope, pooled_slope, sample_count, r_squared):
-    """Shrink a trophy slope toward its pool less strongly as evidence rises."""
-    evidence = max(0, sample_count - 2) * max(0.0, r_squared)
-    pool_weight = BASE_SHRINKAGE / (1.0 + evidence)
-    return (1.0 - pool_weight) * slope + pool_weight * pooled_slope
+def assign_pool(tier, rate, first_boundary, second_boundary):
+    if rate <= first_boundary:
+        band = 0
+    elif rate <= second_boundary:
+        band = 1
+    elif rate > second_boundary:
+        band = 2
+    return tier, band
 
 
-def valid_quantiles(values):
-    """Round half up to four places and keep adjacent quantiles distinct."""
-    units = [min(999900, max(100, math.floor(value * 10000.0 + 0.5))) for value in values]
-    for index in range(1, len(units)):
-        units[index] = max(units[index], units[index - 1] + 1)
-    if units[-1] > 999900:
-        units[-1] = 999900
-        for index in range(len(units) - 2, -1, -1):
-            units[index] = min(units[index], units[index + 1] - 1)
-    return [int(unit / 10000) if unit % 10000 == 0 else unit / 10000 for unit in units]
+def pooled_gradient_map(trophies, recent_rates, models):
+    """Average slopes within each trophy-tier and current-rate tercile pool."""
+    ordered = sorted(recent_rates)
+    lower = ordered[len(ordered) // 3]
+    upper = ordered[2 * len(ordered) // 3]
+    keys = [
+        assign_pool(trophy["tier"], rate, lower, upper)
+        for trophy, rate in zip(trophies, recent_rates)
+    ]
+    buckets = {}
+    for key, model in zip(keys, models):
+        buckets.setdefault(key, []).append(model["gradient"])
+    means = {key: sum(slopes) / len(slopes) for key, slopes in buckets.items()}
+    return keys, means
 
 
-def forecast_case(case, name="case"):
-    if case.get("levels") != LEVELS:
-        raise ValueError(f"{name} has unsupported quantile levels")
-    if not case.get("history"):
-        raise ValueError(f"{name} has no history")
+def combine_gradient(own_gradient, group_gradient, observations, quality):
+    evidence = max(0, observations - 2) * max(0.0, quality)
+    group_share = POOLING_STRENGTH / (1.0 + evidence)
+    return own_gradient * (1.0 - group_share) + group_gradient * group_share
 
-    reads = case["history"][-HISTORY_WINDOW:]
-    read_times = [parse_time(read["at"]) for read in reads]
-    origin = read_times[0]
-    elapsed_minutes = [(instant - origin).total_seconds() / 60.0 for instant in read_times]
-    all_xs = [math.log1p(max(0.0, minutes)) for minutes in elapsed_minutes]
-    target_minutes = max(0.0, (parse_time(case["target"]) - origin).total_seconds() / 60.0)
-    target_x = math.log1p(target_minutes)
-    observed_span = max(0.0, (read_times[-1] - read_times[0]).total_seconds() / 60.0)
 
-    fits = []
-    last_rates = []
-    for trophy_index in range(len(case["trophies"])):
-        samples = [
-            (x, logit(read["rates"][trophy_index]))
-            for x, read in zip(all_xs, reads)
-            if read["rates"][trophy_index] is not None
+def distinct_four_place_rates(raw_rates):
+    ticks = [max(100, min(999900, numbers.floor(rate * 10000.0 + 0.5))) for rate in raw_rates]
+    for position in range(1, len(ticks)):
+        ticks[position] = max(ticks[position], ticks[position - 1] + 1)
+    if ticks[-1] > 999900:
+        ticks[-1] = 999900
+        for position in range(len(ticks) - 2, -1, -1):
+            ticks[position] = min(ticks[position], ticks[position + 1] - 1)
+    return [tick // 10000 if tick % 10000 == 0 else tick / 10000 for tick in ticks]
+
+
+def make_forecast(case, label):
+    if case.get("levels") != QUANTILE_LEVELS:
+        raise ValueError(f"{label} has unsupported quantile levels")
+    if len(case.get("history", [])) == 0:
+        raise ValueError(f"{label} has no history")
+
+    reads = case["history"][-MAX_READS:]
+    moments = [timestamp(read["at"]) for read in reads]
+    start = moments[0]
+    minute_marks = [(moment - start).total_seconds() / 60.0 for moment in moments]
+    transformed_time = [numbers.log1p(max(0.0, minute)) for minute in minute_marks]
+    target_minutes = max(0.0, (timestamp(case["target"]) - start).total_seconds() / 60.0)
+    target_time = numbers.log1p(target_minutes)
+    span = max(0.0, (moments[-1] - moments[0]).total_seconds() / 60.0)
+
+    models = []
+    recent_rates = []
+    for trophy_number, _ in enumerate(case["trophies"]):
+        points = [
+            (x, rate_to_log_odds(read["rates"][trophy_number]))
+            for x, read in zip(transformed_time, reads)
+            if read["rates"][trophy_number] is not None
         ]
-        if not samples:
-            samples = [(all_xs[-1], logit(0.01))]
-        xs = [sample[0] for sample in samples]
-        ys = [sample[1] for sample in samples]
-        fit = linear_fit(xs, ys)
-        stationary = max(ys) - min(ys) < 1e-6
-        fits.append((*fit, len(ys), observed_span, stationary, ys[-1]))
-        last_rates.append(inv_logit(ys[-1]))
+        if not points:
+            points = [(transformed_time[-1], rate_to_log_odds(0.01))]
+        model = least_squares(points)
+        values = [y for _, y in points]
+        model["unchanged"] = max(values) - min(values) < 1e-6
+        model["latest"] = values[-1]
+        model["count"] = len(values)
+        models.append(model)
+        recent_rates.append(log_odds_to_rate(values[-1]))
 
-    ranked_rates = sorted(last_rates)
-    lower_cut = ranked_rates[len(ranked_rates) // 3]
-    upper_cut = ranked_rates[2 * len(ranked_rates) // 3]
-    pool_members = {}
-    pool_keys = []
-    for trophy, rate, fit in zip(case["trophies"], last_rates, fits):
-        band = 0 if rate <= lower_cut else 1 if rate <= upper_cut else 2
-        key = (trophy["tier"], band)
-        pool_keys.append(key)
-        pool_members.setdefault(key, []).append(fit[1])
-    pooled_slopes = {key: sum(values) / len(values) for key, values in pool_members.items()}
+    membership, group_means = pooled_gradient_map(case["trophies"], recent_rates, models)
 
-    horizon = max(0.0, float(case["horizon_minutes"]))
-    rows = []
-    for trophy, fit, key in zip(case["trophies"], fits, pool_keys):
-        intercept, slope, residual_sd, r_squared, count, span, stationary, last_value = fit
-        if stationary:
-            prediction = last_value
-            sigma_eff = 0.05
-        else:
-            calibrated_slope = evidence_weighted_slope(slope, pooled_slopes[key], count, r_squared)
-            prediction = intercept + calibrated_slope * target_x
-            prediction = min(last_value + 2.0, max(last_value - 2.0, prediction))
-            safe_span = max(span, 1e-9)
-            sigma_eff = math.sqrt(
-                max(residual_sd, 0.08) ** 2 * (1.0 + horizon / safe_span)
-                + (0.05 * math.sqrt(horizon / 60.0)) ** 2
+    horizon = float(max(0.0, case["horizon_minutes"]))
+    answers = []
+    for trophy, model, group in zip(case["trophies"], models, membership):
+        if model["unchanged"]:
+            center = model["latest"]
+            uncertainty = 0.05
+        elif not model["unchanged"]:
+            gradient = combine_gradient(
+                model["gradient"], group_means[group], model["count"], model["quality"]
             )
-        projected = [clamp_rate(inv_logit(prediction + z * sigma_eff)) for z in Z_SCORES]
-        rows.append({"id": trophy["id"], "q": valid_quantiles(projected)})
-    return {"trophies": rows}
+            center = model["constant"] + gradient * target_time
+            center = max(model["latest"] - 2.0, min(model["latest"] + 2.0, center))
+            uncertainty = numbers.sqrt(
+                max(model["sd"], 0.08) ** 2 * (1.0 + horizon / max(span, 1e-9))
+                + (0.05 * numbers.sqrt(horizon / 60.0)) ** 2
+            )  # effective forecast deviation
+        raw_quantiles = [
+            bounded_rate(log_odds_to_rate(center + offset * uncertainty))
+            for offset in NORMAL_OFFSETS
+        ]
+        answers.append({"id": trophy["id"], "q": distinct_four_place_rates(raw_quantiles)})
+    return {"trophies": answers}
 
 
-def main():
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    for input_path in sorted(INPUT_DIR.glob("*.in")):
-        case = json.loads(input_path.read_text(encoding="utf-8"))
-        forecast = forecast_case(case, input_path.name)
-        output_path = OUTPUT_DIR / f"{input_path.stem}.out"
-        output_path.write_text(json.dumps(forecast, separators=(",", ":")) + "\n", encoding="utf-8")
+def run():
+    source = FilePath(environment.environ.get("MAKEFUN_INPUT_DIR", "/input"))
+    destination = FilePath(environment.environ.get("MAKEFUN_OUTPUT_DIR", "/output"))
+    destination.mkdir(parents=True, exist_ok=True)
+    for case_path in sorted(source.glob("*.in")):
+        case = json_codec.loads(case_path.read_text(encoding="utf-8"))
+        result = make_forecast(case, case_path.name)
+        result_path = destination / f"{case_path.stem}.out"
+        result_path.write_text(json_codec.dumps(result, separators=(",", ":")) + "\n", encoding="utf-8")
 
 
-if __name__ == "__main__":
-    main()
+if "__main__" == __name__:
+    run()
