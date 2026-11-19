@@ -111,8 +111,6 @@ def make_forecast(case, label):
     transformed_time = [numbers.log1p(max(0.0, minute)) for minute in minute_marks]
     target_minutes = max(0.0, (timestamp(case["target"]) - start).total_seconds() / 60.0)
     target_time = numbers.log1p(target_minutes)
-    span = max(0.0, (moments[-1] - moments[0]).total_seconds() / 60.0)
-
     models = []
     recent_rates = []
     for trophy_number, _ in enumerate(case["trophies"]):
@@ -138,17 +136,15 @@ def make_forecast(case, label):
     for trophy, model, group in zip(case["trophies"], models, membership):
         if model["unchanged"]:
             center = model["latest"]
-            uncertainty = 0.05
+            uncertainty = 0.6
         elif not model["unchanged"]:
             gradient = combine_gradient(
                 model["gradient"], group_means[group], model["count"], model["quality"]
             )
-            center = model["constant"] + gradient * target_time
-            center = max(model["latest"] - 2.0, min(model["latest"] + 2.0, center))
-            uncertainty = numbers.sqrt(
-                max(model["sd"], 0.08) ** 2 * (1.0 + horizon / max(span, 1e-9))
-                + (0.05 * numbers.sqrt(horizon / 60.0)) ** 2
-            )  # effective forecast deviation
+            fitted_center = model["constant"] + gradient * target_time
+            center = model["latest"] + 0.5 * (fitted_center - model["latest"])
+            center = max(model["latest"] - 1.5, min(model["latest"] + 1.5, center))
+            uncertainty = 0.9 + 0.55 * numbers.log10(1.0 + horizon / 60.0)
         raw_quantiles = [
             bounded_rate(log_odds_to_rate(center + offset * uncertainty))
             for offset in NORMAL_OFFSETS
